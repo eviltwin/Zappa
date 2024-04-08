@@ -309,6 +309,17 @@ class EventSourceMappingMixin(BaseEventSource):
     def batch_window(self) -> int:
         return self._config.get("batch_window", 1 if self.batch_size > 10 else 0)
 
+    @property
+    def function_response_types(self) -> List[str]:
+        return ["ReportBatchItemFailures"] if self._config.get("report_batch_item_failures", False) else []
+
+    @property
+    def scaling_config(self) -> Dict[str, Any]:
+        maximum_concurrency = self._config.get("maximum_concurrency", None)
+        if maximum_concurrency is None:
+            return {}
+        return {"MaximumConcurrency": maximum_concurrency}
+
     def _get_uuid(self, function_arn: str) -> Optional[str]:
         uuid = None
         response = self._lambda.list_event_source_mappings(
@@ -331,6 +342,14 @@ class EventSourceMappingMixin(BaseEventSource):
             # Add batch window for SQS
             if hasattr(self, "_supports_batch_window") and self._supports_batch_window:
                 kwargs["MaximumBatchingWindowInSeconds"] = self.batch_window
+
+            # Partial batch responses, supported by SQS, Kinesis and DynamoDB streams
+            if self.function_response_types:
+                kwargs["FunctionResponseTypes"] = self.function_response_types
+
+            # Scaling config is SQS-only
+            if getattr(self, "_supports_scaling_config", False) and self.scaling_config:
+                kwargs["ScalingConfig"] = self.scaling_config
 
             response = self._lambda.create_event_source_mapping(**kwargs)
             LOG.debug(response)
@@ -411,6 +430,7 @@ class SqsEventSource(EventSourceMappingMixin, BaseEventSource):
     """SQS event source implementation"""
 
     _supports_batch_window = True
+    _supports_scaling_config = True
 
 
 class DynamoDBStreamEventSource(EventSourceMappingMixin, BaseEventSource):

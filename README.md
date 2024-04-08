@@ -890,6 +890,8 @@ By default, if your function encounters an error while processing a batch, all m
                "event_source": {
                     "arn":  "arn:aws:sqs:us-east-1:12341234:your-queue-name-arn",
                     "batch_size": 10, // Maximum: 10 for FIFO and 10,000 for Standard. Use 1 to trigger immediate processing
+                    "report_batch_item_failures": false, // Default is false. Set true if your handler returns a `batchItemFailures` field, so only the failed messages become visible again
+                    "maximum_concurrency": 10, // Optional. Caps the number of concurrent Lambda invocations for this queue. Minimum: 2
                     "enabled": true // Default is false
                }
            }
