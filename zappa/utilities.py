@@ -294,7 +294,7 @@ class BaseEventSource:
     def status(self, function_arn: str) -> Optional[Dict[str, Any]]:
         raise NotImplementedError
 
-    def update(self, function_arn: str) -> None:
+    def update(self, function_arn: str) -> Optional[Dict[str, Any]]:
         raise NotImplementedError
 
 
@@ -378,12 +378,12 @@ class EventSourceMappingMixin(BaseEventSource):
         except Exception:
             LOG.exception("Unable to disable event source")
 
-    def update(self, function_arn: str) -> None:
+    def update(self, function_arn: str) -> Optional[Dict[str, Any]]:
         response = None
         uuid = self._get_uuid(function_arn)
         if uuid:
             try:
-                kwargs = {
+                kwargs: Dict[str, Any] = {
                     "UUID": uuid,
                     "BatchSize": self.batch_size,
                     "Enabled": self.enabled,
@@ -393,10 +393,19 @@ class EventSourceMappingMixin(BaseEventSource):
                 if hasattr(self, "_supports_batch_window") and self._supports_batch_window:
                     kwargs["MaximumBatchingWindowInSeconds"] = self.batch_window
 
+                # Unlike create, omitting a field on update means "leave unchanged", so these
+                # are always sent to keep zappa_settings authoritative. Dropping
+                # report_batch_item_failures or maximum_concurrency from the config must
+                # actually clear them on the mapping.
+                kwargs["FunctionResponseTypes"] = self.function_response_types
+                if getattr(self, "_supports_scaling_config", False):
+                    kwargs["ScalingConfig"] = self.scaling_config
+
                 response = self._lambda.update_event_source_mapping(**kwargs)
                 LOG.debug(response)
             except Exception:
                 LOG.exception("Unable to update event source")
+        return response
 
     def remove(self, function_arn: str) -> Optional[Dict[str, Any]]:
         response = None
@@ -780,12 +789,16 @@ def add_event_source(
     Given an event_source dictionary, create the object and add the event source.
     """
     event_source_obj, function_arn = get_event_source(event_source, lambda_arn, target_function, boto_session, dry=False)
-    # TODO: Detect changes in config and refine exists algorithm
     if not dry:
         if not event_source_obj.status(function_arn):
             event_source_obj.add(function_arn)
             return "successful" if event_source_obj.status(function_arn) else "failed"
         else:
+            # The pull services (SQS, DynamoDB, Kinesis) are excluded from unschedule_events,
+            # so their mappings survive a deploy. Push the current config onto the existing
+            # mapping instead, otherwise settings changes would never take effect.
+            if isinstance(event_source_obj, EventSourceMappingMixin):
+                return "updated" if event_source_obj.update(function_arn) else "failed"
             return "exists"
 
     return "dryrun"
