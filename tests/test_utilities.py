@@ -7,15 +7,20 @@ from pathlib import Path
 from typing import Tuple
 from unittest import mock
 
+import boto3
 import botocore.exceptions
+import botocore.stub
 
 from zappa.core import Zappa
 from zappa.ext.django_zappa import get_django_wsgi
 from zappa.utilities import (
     ApacheNCSAFormatter,
+    DynamoDBStreamEventSource,
     EventSourceMappingMixin,
     InvalidAwsLambdaName,
     S3EventSource,
+    SqsEventSource,
+    add_event_source,
     conflicts_with_a_neighbouring_module,
     contains_python_files_or_subdirs,
     detect_django_settings,
@@ -497,3 +502,260 @@ class EventSourceMappingStatusTestCase(unittest.TestCase):
         mixin = self._make_mixin(mock_client)
         result = mixin.status("arn:aws:lambda:us-east-1:123456789:function:my-func")
         self.assertIsNone(result)
+
+
+class SqsEventSourceOptionsTestCase(unittest.TestCase):
+    """Tests for the SQS report_batch_item_failures and maximum_concurrency options"""
+
+    FUNCTION_ARN = "arn:aws:lambda:us-east-1:123456789:function:my-func"
+    QUEUE_ARN = "arn:aws:sqs:us-east-1:123456789:my-queue"
+
+    def _make_source(self, mock_lambda_client, **config):
+        session = mock.MagicMock()
+        session.client.return_value = mock_lambda_client
+        config.setdefault("arn", self.QUEUE_ARN)
+        return SqsEventSource(session, config)
+
+    def _create_kwargs(self, **config):
+        mock_client = mock.MagicMock()
+        source = self._make_source(mock_client, **config)
+        source.add(self.FUNCTION_ARN)
+        mock_client.create_event_source_mapping.assert_called_once()
+        return mock_client.create_event_source_mapping.call_args.kwargs
+
+    def test_add_sends_both_options_when_configured(self):
+        """Both options should reach create_event_source_mapping."""
+        kwargs = self._create_kwargs(batch_size=100, batch_window=10, report_batch_item_failures=True, maximum_concurrency=5)
+        self.assertEqual(
+            kwargs,
+            {
+                "FunctionName": self.FUNCTION_ARN,
+                "EventSourceArn": self.QUEUE_ARN,
+                "BatchSize": 100,
+                "Enabled": True,
+                "MaximumBatchingWindowInSeconds": 10,
+                "FunctionResponseTypes": ["ReportBatchItemFailures"],
+                "ScalingConfig": {"MaximumConcurrency": 5},
+            },
+        )
+
+    def test_add_omits_options_when_not_configured(self):
+        """Unconfigured options must not be sent, so existing deployments are unaffected."""
+        kwargs = self._create_kwargs()
+        self.assertNotIn("FunctionResponseTypes", kwargs)
+        self.assertNotIn("ScalingConfig", kwargs)
+
+    def test_add_omits_function_response_types_when_false(self):
+        """An explicit false is the same as unset."""
+        kwargs = self._create_kwargs(report_batch_item_failures=False)
+        self.assertNotIn("FunctionResponseTypes", kwargs)
+
+    def test_add_sends_report_batch_item_failures_alone(self):
+        kwargs = self._create_kwargs(report_batch_item_failures=True)
+        self.assertEqual(kwargs["FunctionResponseTypes"], ["ReportBatchItemFailures"])
+        self.assertNotIn("ScalingConfig", kwargs)
+
+    def test_add_sends_maximum_concurrency_alone(self):
+        kwargs = self._create_kwargs(maximum_concurrency=2)
+        self.assertEqual(kwargs["ScalingConfig"], {"MaximumConcurrency": 2})
+        self.assertNotIn("FunctionResponseTypes", kwargs)
+
+    def test_scaling_config_is_sqs_only(self):
+        """DynamoDB and Kinesis mappings do not accept ScalingConfig."""
+        self.assertTrue(getattr(SqsEventSource, "_supports_scaling_config", False))
+        self.assertFalse(getattr(DynamoDBStreamEventSource, "_supports_scaling_config", False))
+
+
+class EventSourceMappingUpdateTestCase(unittest.TestCase):
+    """add_event_source() must push config onto an existing mapping, not skip it
+
+    SQS, DynamoDB and Kinesis are excluded from unschedule_events, so their mappings
+    survive a deploy. add_event_source used to return "exists" and do nothing, which
+    meant no setting on an existing mapping was ever applied by "zappa update".
+    """
+
+    FUNCTION_ARN = "arn:aws:lambda:us-east-1:123456789:function:my-func"
+    QUEUE_ARN = "arn:aws:sqs:us-east-1:123456789:my-queue"
+    STREAM_ARN = "arn:aws:dynamodb:us-east-1:123456789:table/my-table/stream/2024-01-01T00:00:00.000"
+
+    def _session_for(self, mock_lambda_client, existing=True):
+        session = mock.MagicMock()
+        session.client.return_value = mock_lambda_client
+        mappings = [{"UUID": "test-uuid"}] if existing else []
+        mock_lambda_client.list_event_source_mappings.return_value = {"EventSourceMappings": mappings}
+        mock_lambda_client.get_event_source_mapping.return_value = {"UUID": "test-uuid", "State": "Enabled"}
+        mock_lambda_client.update_event_source_mapping.return_value = {"UUID": "test-uuid", "State": "Enabled"}
+        return session
+
+    def _update_kwargs(self, mock_client):
+        mock_client.update_event_source_mapping.assert_called_once()
+        return mock_client.update_event_source_mapping.call_args.kwargs
+
+    def test_existing_mapping_is_updated(self):
+        """A live mapping should be reconfigured rather than reported as "exists"."""
+        mock_client = mock.MagicMock()
+        session = self._session_for(mock_client)
+        event_source = {
+            "arn": self.QUEUE_ARN,
+            "batch_size": 50,
+            "batch_window": 20,
+            "report_batch_item_failures": True,
+            "maximum_concurrency": 7,
+        }
+        result = add_event_source(event_source, self.FUNCTION_ARN, "test_settings.callback", session)
+
+        self.assertEqual(result, "updated")
+        self.assertEqual(
+            self._update_kwargs(mock_client),
+            {
+                "UUID": "test-uuid",
+                "FunctionName": self.FUNCTION_ARN,
+                "BatchSize": 50,
+                "Enabled": True,
+                "MaximumBatchingWindowInSeconds": 20,
+                "FunctionResponseTypes": ["ReportBatchItemFailures"],
+                "ScalingConfig": {"MaximumConcurrency": 7},
+            },
+        )
+        mock_client.create_event_source_mapping.assert_not_called()
+
+    def test_update_clears_options_removed_from_config(self):
+        """On update an omitted field means "leave unchanged", so empties must be sent."""
+        mock_client = mock.MagicMock()
+        session = self._session_for(mock_client)
+        result = add_event_source({"arn": self.QUEUE_ARN}, self.FUNCTION_ARN, "test_settings.callback", session)
+
+        self.assertEqual(result, "updated")
+        kwargs = self._update_kwargs(mock_client)
+        self.assertEqual(kwargs["FunctionResponseTypes"], [])
+        self.assertEqual(kwargs["ScalingConfig"], {})
+
+    def test_update_omits_sqs_only_params_for_dynamodb(self):
+        """DynamoDB streams share the mixin but accept neither param."""
+        mock_client = mock.MagicMock()
+        session = self._session_for(mock_client)
+        result = add_event_source({"arn": self.STREAM_ARN}, self.FUNCTION_ARN, "test_settings.callback", session)
+
+        self.assertEqual(result, "updated")
+        kwargs = self._update_kwargs(mock_client)
+        self.assertNotIn("ScalingConfig", kwargs)
+        self.assertNotIn("MaximumBatchingWindowInSeconds", kwargs)
+
+    def test_absent_mapping_is_created_not_updated(self):
+        """The create path must be unchanged when no mapping exists."""
+        mock_client = mock.MagicMock()
+        session = self._session_for(mock_client, existing=False)
+        # status() is called before and after add(); report the mapping as live the second time
+        mock_client.list_event_source_mappings.side_effect = [
+            {"EventSourceMappings": []},
+            {"EventSourceMappings": [{"UUID": "test-uuid"}]},
+        ]
+        result = add_event_source({"arn": self.QUEUE_ARN}, self.FUNCTION_ARN, "test_settings.callback", session)
+
+        self.assertEqual(result, "successful")
+        mock_client.create_event_source_mapping.assert_called_once()
+        mock_client.update_event_source_mapping.assert_not_called()
+
+    def test_failed_update_is_reported(self):
+        """A swallowed update error must surface as "failed", not "updated"."""
+        mock_client = mock.MagicMock()
+        session = self._session_for(mock_client)
+        error_response = {"Error": {"Code": "ResourceConflictException", "Message": "in progress"}}
+        mock_client.update_event_source_mapping.side_effect = botocore.exceptions.ClientError(
+            error_response, "UpdateEventSourceMapping"
+        )
+        result = add_event_source({"arn": self.QUEUE_ARN}, self.FUNCTION_ARN, "test_settings.callback", session)
+
+        self.assertEqual(result, "failed")
+
+    def test_dry_run_makes_no_api_calls(self):
+        mock_client = mock.MagicMock()
+        session = self._session_for(mock_client)
+        result = add_event_source({"arn": self.QUEUE_ARN}, self.FUNCTION_ARN, "test_settings.callback", session, dry=True)
+
+        self.assertEqual(result, "dryrun")
+        mock_client.create_event_source_mapping.assert_not_called()
+        mock_client.update_event_source_mapping.assert_not_called()
+
+
+class SqsEventSourceRequestValidationTestCase(unittest.TestCase):
+    """Validate the SQS request shapes against the real botocore service model
+
+    MagicMock accepts any keyword, so these use botocore's Stubber to confirm the
+    parameters are ones the Lambda API actually defines.
+    """
+
+    FUNCTION_ARN = "arn:aws:lambda:us-east-1:123456789:function:my-func"
+    QUEUE_ARN = "arn:aws:sqs:us-east-1:123456789:my-queue"
+    MAPPING = {"UUID": "test-uuid", "State": "Enabled"}
+
+    def _stubbed_session(self):
+        client = boto3.Session(aws_access_key_id="dummy", aws_secret_access_key="dummy", region_name="us-east-1").client(
+            "lambda"
+        )
+        session = mock.MagicMock()
+        session.client.return_value = client
+        return session, botocore.stub.Stubber(client)
+
+    def _listing(self, mappings):
+        return {"EventSourceMappings": mappings}
+
+    def test_create_request_is_valid(self):
+        session, stubber = self._stubbed_session()
+        expected = {"FunctionName": self.FUNCTION_ARN, "EventSourceArn": self.QUEUE_ARN}
+        stubber.add_response("list_event_source_mappings", self._listing([]), expected)
+        stubber.add_response(
+            "create_event_source_mapping",
+            self.MAPPING,
+            {
+                "FunctionName": self.FUNCTION_ARN,
+                "EventSourceArn": self.QUEUE_ARN,
+                "BatchSize": 100,
+                "Enabled": True,
+                "MaximumBatchingWindowInSeconds": 10,
+                "FunctionResponseTypes": ["ReportBatchItemFailures"],
+                "ScalingConfig": {"MaximumConcurrency": 5},
+            },
+        )
+        stubber.add_response("list_event_source_mappings", self._listing([self.MAPPING]), expected)
+        stubber.add_response("get_event_source_mapping", self.MAPPING, {"UUID": "test-uuid"})
+
+        event_source = {
+            "arn": self.QUEUE_ARN,
+            "batch_size": 100,
+            "batch_window": 10,
+            "report_batch_item_failures": True,
+            "maximum_concurrency": 5,
+        }
+        with stubber:
+            result = add_event_source(event_source, self.FUNCTION_ARN, "test_settings.callback", session)
+
+        self.assertEqual(result, "successful")
+        stubber.assert_no_pending_responses()
+
+    def test_update_request_clearing_options_is_valid(self):
+        """An empty ScalingConfig is the documented way to remove a concurrency cap."""
+        session, stubber = self._stubbed_session()
+        expected = {"FunctionName": self.FUNCTION_ARN, "EventSourceArn": self.QUEUE_ARN}
+        stubber.add_response("list_event_source_mappings", self._listing([self.MAPPING]), expected)
+        stubber.add_response("get_event_source_mapping", self.MAPPING, {"UUID": "test-uuid"})
+        stubber.add_response("list_event_source_mappings", self._listing([self.MAPPING]), expected)
+        stubber.add_response(
+            "update_event_source_mapping",
+            self.MAPPING,
+            {
+                "UUID": "test-uuid",
+                "FunctionName": self.FUNCTION_ARN,
+                "BatchSize": 10,
+                "Enabled": True,
+                "MaximumBatchingWindowInSeconds": 0,
+                "FunctionResponseTypes": [],
+                "ScalingConfig": {},
+            },
+        )
+
+        with stubber:
+            result = add_event_source({"arn": self.QUEUE_ARN}, self.FUNCTION_ARN, "test_settings.callback", session)
+
+        self.assertEqual(result, "updated")
+        stubber.assert_no_pending_responses()
